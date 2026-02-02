@@ -40,7 +40,7 @@
 	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
 	 "r2_buckets": [
     {
-      "binding": "R2_BUCKET", // <~ valid JavaScript variable name
+      "binding": "GIT_R2", // <~ valid JavaScript variable name
       "bucket_name": "dev-edge-git"
     }
   ]
