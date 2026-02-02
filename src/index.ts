@@ -5,6 +5,13 @@ export interface Env {
 /* ======================================================
  * 基础工具
  * ====================================================== */
+function sidebandPacket(data: Uint8Array) {
+  const out = new Uint8Array(data.length + 1);
+  out[0] = 1; // channel 1
+  out.set(data, 1);
+  return pktLine(out);
+}
+
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -68,11 +75,7 @@ async function repoExists(env: Env, org: string, repo: string) {
   return list.objects.length > 0;
 }
 
-async function initRepo(env: Env, org: string, repo: string) {
-  const base = join("repos", org, repo);
-  await env.GIT_R2.put(join(base, "HEAD"), "ref: refs/heads/main\n");
-  await env.GIT_R2.put(join(base, "refs/heads/main"), "");
-}
+
 
 async function listRefs(env: Env, org: string, repo: string) {
   const prefix = join("repos", org, repo, "refs/heads/");
@@ -111,10 +114,10 @@ async function handleInfoRefs(
 
   const refs = await listRefs(env, org, repo);
 
-  const capabilities =
-    service === "git-receive-pack"
-      ? "report-status delete-refs side-band-64k quiet atomic ofs-delta"
-      : "multi_ack thin-pack side-band side-band-64k ofs-delta shallow";
+const capabilities =
+  service === "git-receive-pack"
+    ? "report-status delete-refs side-band-64k quiet atomic ofs-delta"
+    : "multi_ack_detailed multi_ack thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag";
 
   const out: Uint8Array[] = [];
   out.push(pktLine(`# service=${service}\n`));
@@ -154,61 +157,123 @@ async function handleUploadPack(env: Env, org: string, repo: string) {
   }
 
   const latest = list.objects.sort((a, b) => b.uploaded - a.uploaded)[0];
-  const pack = await env.GIT_R2.get(latest.key);
+  const packObj = await env.GIT_R2.get(latest.key);
+  const packData = new Uint8Array(await packObj!.arrayBuffer());
 
-  const sideband = new Uint8Array([
-    1,
-    ...(new Uint8Array(await pack!.arrayBuffer()))
-  ]);
+  const chunks: Uint8Array[] = [];
 
-  return new Response(concat([pktLine(sideband), pktFlush()]), {
-    headers: { "Content-Type": "application/x-git-upload-pack-result" }
+  const MAX = 65500; // pkt safe
+
+  for (let i = 0; i < packData.length; i += MAX) {
+    const slice = packData.slice(i, i + MAX);
+
+    const side = new Uint8Array(slice.length + 1);
+    side[0] = 1; // channel 1 = pack
+    side.set(slice, 1);
+
+    chunks.push(pktLine(side));
+  }
+
+  chunks.push(pktFlush());
+
+  return new Response(concat(chunks), {
+    headers: {
+      "Content-Type": "application/x-git-upload-pack-result"
+    }
   });
 }
+
 
 /* ======================================================
  * git-receive-pack (push)
  * ====================================================== */
 
-async function handleReceivePack(
-  env: Env,
-  org: string,
-  repo: string,
-  request: Request
-) {
-  const raw = new Uint8Array(await request.arrayBuffer());
+/* ======================================================
+ * 修正版 initRepo
+ * ====================================================== */
+async function initRepo(env: Env, org: string, repo: string) {
+  const base = join("repos", org, repo);
+  await env.GIT_R2.put(join(base, "HEAD"), "ref: refs/heads/main\n");
+  await env.GIT_R2.put(join(base, "refs/heads/main"), zeroOid() + "\n");
+}
 
-  const packStart = findPackStart(raw);
-  const pack = raw.slice(packStart);
+/* ======================================================
+ * 修正版 readRef
+ * ====================================================== */
+async function readRef(env: Env, base: string, ref: string) {
+  const obj = await env.GIT_R2.get(join(base, ref));
+  if (!obj) return zeroOid();
+  const text = (await obj.text()).trim();
+  return text === "" ? zeroOid() : text;
+}
 
-  const hash = crypto.randomUUID().replace(/-/g, "");
+/* ======================================================
+ * 修正版 handleReceivePack
+ * ====================================================== */
+async function handleReceivePack(env: Env, org: string, repo: string, request: Request) {
+  const buf = new Uint8Array(await request.arrayBuffer());
+  const { commands, packStart } = parseReceiveCommands(buf);
   const base = join("repos", org, repo);
 
-  await env.GIT_R2.put(
-    join(base, `objects/pack/pack-${hash}.pack`),
-    pack
-  );
+  const results: Uint8Array[] = [];
+  results.push(pktLine("unpack ok\n"));
 
-  const newSha = extractNewHead(raw);
-  if (newSha) {
-    await env.GIT_R2.put(
-      join(base, "refs/heads/main"),
-      newSha + "\n"
-    );
+  for (const cmd of commands) {
+    const current = await readRef(env, base, cmd.ref);
+    const oldSha = cmd.old === zeroOid() ? zeroOid() : cmd.old;
+
+    if (current !== oldSha && oldSha !== zeroOid()) {
+      results.push(pktLine(`ng ${cmd.ref} non-fast-forward\n`));
+      continue;
+    }
+
+    await env.GIT_R2.put(join(base, cmd.ref), cmd.new + "\n");
+    results.push(pktLine(`ok ${cmd.ref}\n`));
   }
 
-  const out = concat([
-    pktLine("unpack ok\n"),
-    pktLine("ok refs/heads/main\n"),
-    pktFlush()
-  ]);
+  // 存储 pack
+  const pack = buf.slice(packStart);
+  if (pack.length > 0) {
+    const hash = crypto.randomUUID().replace(/-/g, "");
+    await env.GIT_R2.put(join(base, `objects/pack/pack-${hash}.pack`), pack);
+  }
 
-  return new Response(out, {
-    headers: {
-      "Content-Type": "application/x-git-receive-pack-result"
-    }
+  // side-band channel 1 包装每条 pktLine
+  const sideband = concat(results.map(r => sidebandPacket(r)));
+  const final = concat([sideband, pktFlush()]);
+
+  return new Response(final, {
+    headers: { "Content-Type": "application/x-git-receive-pack-result" }
   });
 }
+
+
+/* ======================================================
+ * parseReceiveCommands 保持原有逻辑
+ * ====================================================== */
+function parseReceiveCommands(buf: Uint8Array) {
+  let i = 0;
+  const commands = [];
+
+  while (true) {
+    const len = parseInt(decoder.decode(buf.slice(i, i + 4)), 16);
+    if (len === 0) {
+      i += 4;
+      break;
+    }
+
+    const line = decoder.decode(buf.slice(i + 4, i + len));
+    i += len;
+
+    const [oldSha, newSha, refPart] = line.trim().split(" ");
+    const ref = refPart.split("\0")[0];
+
+    commands.push({ old: oldSha, new: newSha, ref });
+  }
+
+  return { commands, packStart: findPackStart(buf) };
+}
+
 
 /* ======================================================
  * pack / ref 解析（最小）
